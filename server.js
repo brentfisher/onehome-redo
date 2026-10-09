@@ -16,9 +16,14 @@ const UPSTREAM_TIMEOUT_MS = 20000;
 // Photo URLs are signed and stop working 30 minutes after they are issued.
 const MEDIA_TTL_MS = 20 * 60 * 1000;
 const SEARCH_TTL_MS = 5 * 60 * 1000;
+const LINK_CHECK_MS = 10 * 60 * 1000;
+const GEOCODER = 'https://nominatim.openstreetmap.org/search';
+const GEOCODER_UA = 'onehome-bigscreen/1.0 (+https://github.com/brentfisher/onehome-redo)';
 
 let link = loadLink();
 let session = null; // { sessionToken, groupID, savedSearchID }
+// Whether OneHome accepted the link last time we asked: true, false, or null for "not known".
+let linkCheck = { ok: null, at: 0, error: null };
 let sessionPromise = null;
 let searchCache = null; // { at, data }
 let searchPromise = null;
@@ -27,13 +32,17 @@ const details = new Map(); // listingId -> { at, data } | { promise }
 function loadLink() {
   try {
     const saved = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-    if (saved.token) return { token: saved.token, searchId: saved.searchId || '' };
+    if (saved.token) {
+      const savedAt = saved.savedAt || fs.statSync(CONFIG_FILE).mtime.toISOString();
+      return { token: saved.token, searchId: saved.searchId || '', savedAt };
+    }
   } catch {}
-  return { token: '', searchId: '' };
+  return { token: '', searchId: '', savedAt: null };
 }
 
 function setLink(next) {
-  link = next;
+  link = { ...next, savedAt: new Date().toISOString() };
+  linkCheck = { ok: null, at: 0, error: null };
   session = null;
   sessionPromise = null;
   searchCache = null;
@@ -82,10 +91,48 @@ async function openSession() {
     signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
   });
   const body = await res.text();
-  if (!res.ok) throw new UpstreamError(`OneHome rejected the link token (HTTP ${res.status})`, 401);
-  const data = JSON.parse(body);
-  if (!data.sessionToken || !data.groupID) throw new UpstreamError('OneHome did not return a session for this link', 401);
+  let data = null;
+  try { data = JSON.parse(body); } catch {}
+  // A 5xx says nothing about the link itself, so only 4xx marks it as rejected.
+  if (res.status >= 500) throw new UpstreamError(`OneHome returned HTTP ${res.status}`, 502);
+  if (!res.ok || !data?.sessionToken || !data?.groupID) {
+    const error = res.ok ? 'OneHome did not return a session for this link' : `OneHome rejected the link (HTTP ${res.status})`;
+    linkCheck = { ok: false, at: Date.now(), error };
+    throw new UpstreamError(error, 401);
+  }
+  linkCheck = { ok: true, at: Date.now(), error: null };
   return data;
+}
+
+// Finds an expiry time inside a link token, if it carries one. OneHome's emailed
+// links are plain JSON without one, but a signed token would have "exp".
+function linkExpiry(token) {
+  const decode = (part) => {
+    try { return JSON.parse(Buffer.from(part, 'base64url').toString('utf8')); } catch { return null; }
+  };
+  const parts = String(token).split('.');
+  const claims = decode(parts.length === 3 ? parts[1] : parts[0]);
+  const exp = Number(claims?.exp ?? claims?.expires ?? claims?.expiry);
+  if (!Number.isFinite(exp) || exp <= 0) return null;
+  return new Date(exp < 1e12 ? exp * 1000 : exp).toISOString();
+}
+
+async function linkStatus() {
+  if (!link.token) return { hasLink: false };
+  if (Date.now() - linkCheck.at > LINK_CHECK_MS) {
+    try {
+      const fresh = await openSession();
+      session = fresh;
+    } catch {}
+  }
+  return {
+    hasLink: true,
+    ok: linkCheck.ok,
+    error: linkCheck.error,
+    savedAt: link.savedAt,
+    checkedAt: linkCheck.at ? new Date(linkCheck.at).toISOString() : null,
+    expiresAt: linkExpiry(link.token),
+  };
 }
 
 function getSession() {
@@ -143,7 +190,7 @@ const LISTINGS_QUERY = `query($groupId: String!, $listingIds: [String!]!, $pageI
         ListPrice PreviousListPrice StandardStatus
         BedroomsTotal BathroomsTotalInteger
         LivingArea LivingAreaTotal AboveGradeFinishedArea BuildingAreaTotal
-        LotSizeArea LotSizeUnits MajorChangeType
+        LotSizeArea LotSizeUnits MajorChangeType Latitude Longitude
       }
       customProperty { LivingAreaRange }
     }
@@ -160,7 +207,7 @@ const DETAIL_QUERY = `query($listingId: String!, $groupId: String!) {
       ListPrice PreviousListPrice OriginalListPrice StandardStatus DaysOnMarket ListingId
       BedroomsTotal BathroomsTotalInteger BathroomsFull BathroomsHalf
       LivingArea LivingAreaTotal AboveGradeFinishedArea BelowGradeFinishedArea BuildingAreaTotal
-      LotSizeArea LotSizeUnits YearBuilt StoriesTotal Levels ArchitecturalStyle
+      LotSizeArea LotSizeUnits Latitude Longitude YearBuilt StoriesTotal Levels ArchitecturalStyle
       GarageSpaces ParkingTotal ParkingFeatures Basement
       Heating Cooling Flooring Appliances InteriorFeatures ExteriorFeatures
       FireplacesTotal PoolPrivateYN PoolFeatures PatioAndPorchFeatures LotFeatures
@@ -203,6 +250,8 @@ function summarize(listing) {
     sqft: sqft(p, listing.customProperty),
     lot: p.LotSizeArea,
     lotUnits: p.LotSizeUnits,
+    lat: p.Latitude ?? null,
+    lng: p.Longitude ?? null,
   };
 }
 
@@ -290,6 +339,123 @@ function getDetail(id) {
   return promise;
 }
 
+const PINS_QUERY = `query($groupId: String!, $browseParameter: BrowseParameter, $zoom: Int!) {
+  pins(groupId: $groupId, browseParameter: $browseParameter, includeDislikes: false, zoom: $zoom) {
+    totalListingCount
+    pins { type latitude longitude count ids listPrice standardStatus hideWhenUnauth }
+  }
+}`;
+
+const SUGGEST_QUERY = `query($browseParameter: String!, $groupId: String) {
+  listingSuggestionsSearch(browseParameter: $browseParameter, groupId: $groupId) {
+    id streetNumber streetDirPrefix streetName streetSuffix streetDirSuffix unitNumber
+    city stateOrProvince postalCode listPrice bedroomsTotal bathroomsTotalInteger
+  }
+}`;
+
+// OneHome wants both ends of every range, so open ends get a value nothing reaches.
+const PRICE_CEILING = 100000000;
+const BEDS_CEILING = 99;
+
+function mapFilters(params) {
+  const whole = (name) => {
+    const value = Number(params.get(name));
+    return params.get(name) && Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
+  };
+  // Without a listing type OneHome returns nothing at all.
+  const filters = [{ fieldName: '', type: 'LISTING_TYPE', values: ['FOR_SALE'] }];
+  // Otherwise results include land and commercial property.
+  filters.push(params.get('type') === 'all'
+    ? { fieldName: 'property.PropertyType', type: 'TERMS', values: ['Residential'] }
+    : { fieldName: '', type: 'PROPERTY_TYPE', values: ['House'] });
+  const min = whole('min');
+  const max = whole('max');
+  if (min !== null || max !== null) {
+    filters.push({ fieldName: 'property.ListPrice', type: 'RANGE', values: [String(min ?? 0), String(max ?? PRICE_CEILING)] });
+  }
+  const beds = whole('beds');
+  if (beds) filters.push({ fieldName: 'property.BedroomsTotal', type: 'RANGE', values: [String(beds), String(BEDS_CEILING)] });
+  return filters;
+}
+
+async function mapPins(params) {
+  const [south, west, north, east] = ['s', 'w', 'n', 'e'].map((key) => Number(params.get(key)));
+  const zoom = Math.round(Number(params.get('zoom')));
+  const valid = [south, west, north, east, zoom].every(Number.isFinite)
+    && south < north && west < east && Math.abs(south) <= 90 && Math.abs(north) <= 90;
+  if (!valid) throw new UpstreamError('The map area is not valid', 400);
+  const polygon = [
+    { latitude: north, longitude: east },
+    { latitude: south, longitude: east },
+    { latitude: south, longitude: west },
+    { latitude: north, longitude: west },
+  ];
+  const data = await gql(PINS_QUERY, (s) => ({
+    groupId: s.groupID,
+    browseParameter: { searchQuery: mapFilters(params), polygon, pageInput: { pageNum: 0, size: 300 } },
+    zoom: Math.min(Math.max(zoom, 1), 20),
+  }));
+  const pins = (data.pins?.pins || [])
+    .filter((pin) => !pin.hideWhenUnauth && Number.isFinite(pin.latitude) && Number.isFinite(pin.longitude))
+    .map((pin) => ({
+      cluster: pin.type === 'Cluster',
+      lat: pin.latitude,
+      lng: pin.longitude,
+      count: pin.count || 1,
+      ids: pin.ids || [],
+      price: pin.listPrice,
+      status: pin.standardStatus,
+    }));
+  return { total: data.pins?.totalListingCount ?? 0, pins };
+}
+
+const placeCache = new Map();
+let geocoderFreeAt = 0;
+
+// The geocoder asks for at most one request a second from each app.
+async function findPlaces(query) {
+  const key = query.toLowerCase();
+  if (placeCache.has(key)) return placeCache.get(key);
+  const wait = Math.max(0, geocoderFreeAt - Date.now());
+  geocoderFreeAt = Date.now() + wait + 1100;
+  if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
+  const url = `${GEOCODER}?${new URLSearchParams({ format: 'jsonv2', limit: '5', countrycodes: 'us,ca', q: query })}`;
+  const res = await fetch(url, { headers: { 'user-agent': GEOCODER_UA, 'accept-language': 'en' }, signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
+  if (!res.ok) { await res.body?.cancel(); throw new UpstreamError(`Place search returned HTTP ${res.status}`, 502); }
+  const places = (await res.json()).map((place) => {
+    const [south, north, west, east] = (place.boundingbox || []).map(Number);
+    return { name: place.display_name, lat: Number(place.lat), lng: Number(place.lon), bounds: { south, west, north, east } };
+  }).filter((place) => Number.isFinite(place.lat) && Number.isFinite(place.lng));
+  if (placeCache.size > 200) placeCache.clear();
+  placeCache.set(key, places);
+  return places;
+}
+
+async function findHomes(query) {
+  const data = await gql(SUGGEST_QUERY, (s) => ({ browseParameter: query, groupId: s.groupID }));
+  return (data.listingSuggestionsSearch || []).slice(0, 6).map((hit) => {
+    const street = [hit.streetNumber, hit.streetDirPrefix, hit.streetName, hit.streetSuffix, hit.streetDirSuffix].filter(Boolean).join(' ');
+    return {
+      id: hit.id,
+      street: hit.unitNumber ? `${street} #${hit.unitNumber}` : street,
+      cityLine: [[hit.city, hit.stateOrProvince].filter(Boolean).join(', '), hit.postalCode].filter(Boolean).join(' '),
+      price: hit.listPrice,
+      beds: hit.bedroomsTotal,
+      baths: hit.bathroomsTotalInteger,
+    };
+  });
+}
+
+// Searches homes by address and places by name; one failing does not sink the other.
+async function lookup(query) {
+  const [homes, places] = await Promise.allSettled([findHomes(query), findPlaces(query)]);
+  if (homes.status === 'rejected' && places.status === 'rejected') throw places.reason;
+  return {
+    homes: homes.status === 'fulfilled' ? homes.value : [],
+    places: places.status === 'fulfilled' ? places.value : [],
+  };
+}
+
 function sendJson(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(JSON.stringify(body));
@@ -373,6 +539,13 @@ async function route(req, res) {
   }
 
   if (url.pathname === '/api/search') return sendJson(res, 200, await getSearch());
+  if (url.pathname === '/api/link/status') return sendJson(res, 200, await linkStatus());
+  if (url.pathname === '/api/map') return sendJson(res, 200, await mapPins(url.searchParams));
+  if (url.pathname === '/api/lookup') {
+    const query = (url.searchParams.get('q') || '').trim().slice(0, 120);
+    if (query.length < 2) return sendJson(res, 400, { error: 'Type at least two characters' });
+    return sendJson(res, 200, await lookup(query));
+  }
   if (parts[0] === 'api' && parts[1] === 'listing' && parts[2]) {
     const detail = await getDetail(parts[2]);
     // Photo addresses stay on the server; the page asks for /img/<id>/<n>.

@@ -12,6 +12,7 @@
 <link rel="icon" href="/icon.svg">
 <link rel="apple-touch-icon" href="/icon.svg">
 <title>Homes</title>
+<link rel="stylesheet" href="/leaflet.css">
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
@@ -23,18 +24,65 @@
       <p id="search-count"></p>
     </div>
     <div class="topbar-actions">
+      <nav class="switch" aria-label="View">
+        <a href="#/" aria-current="page">Saved</a>
+        <a href="#/map">Map</a>
+      </nav>
       <select id="sort" aria-label="Sort homes">
         <option value="agent">Agent's order</option>
         <option value="price-desc">Price: high to low</option>
         <option value="price-asc">Price: low to high</option>
         <option value="sqft-desc">Largest first</option>
       </select>
-      <button id="change-link" type="button" class="pill">Change link</button>
+      <button id="change-link" type="button" class="pill link-pill">
+        <span class="link-dot" id="link-dot"></span>
+        <span class="link-text"><span>Change link</span><small id="link-status">Checking link…</small></span>
+      </button>
     </div>
   </header>
   <p id="grid-status" class="status" role="status">Loading homes…</p>
   <div id="cards" class="cards"></div>
 </main>
+
+<section id="map-view" hidden>
+  <div id="map"></div>
+  <div class="mapbar">
+    <nav class="switch" aria-label="View">
+      <a href="#/">Saved</a>
+      <a href="#/map" aria-current="page">Map</a>
+    </nav>
+    <form id="map-search" role="search">
+      <input id="map-q" type="search" placeholder="City, ZIP or address" aria-label="Search the map" enterkeyhint="search" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <button type="submit" class="pill pill-primary">Go</button>
+    </form>
+    <select id="f-price" aria-label="Price">
+      <option value="">Any price</option>
+      <option value="-400000">Under $400k</option>
+      <option value="400000-600000">$400k – $600k</option>
+      <option value="500000-750000">$500k – $750k</option>
+      <option value="600000-900000">$600k – $900k</option>
+      <option value="750000-1000000">$750k – $1M</option>
+      <option value="900000-1200000">$900k – $1.2M</option>
+      <option value="1000000-1500000">$1M – $1.5M</option>
+      <option value="1500000-2500000">$1.5M – $2.5M</option>
+      <option value="2500000-">$2.5M and up</option>
+    </select>
+    <select id="f-beds" aria-label="Bedrooms">
+      <option value="">Any beds</option>
+      <option value="2">2+ beds</option>
+      <option value="3">3+ beds</option>
+      <option value="4">4+ beds</option>
+      <option value="5">5+ beds</option>
+    </select>
+    <select id="f-type" aria-label="Home type">
+      <option value="house">Houses</option>
+      <option value="all">All homes</option>
+    </select>
+  </div>
+  <div id="map-results" class="map-results" hidden></div>
+  <div id="map-card" class="map-card" hidden></div>
+  <p id="map-count" class="map-count" role="status"></p>
+</section>
 
 <section id="viewer" hidden>
   <div id="backdrop" class="backdrop"></div>
@@ -90,6 +138,7 @@
   </form>
 </dialog>
 
+<script src="/leaflet.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

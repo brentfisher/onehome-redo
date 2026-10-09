@@ -6,6 +6,8 @@ A landscape, cast-friendly way to look through a OneHome saved search: large typ
 
 ![List of homes](docs/list.png)
 
+![Map search](docs/map.png)
+
 ## Run it
 
 ```sh
@@ -30,17 +32,32 @@ While casting, set the phone's Auto-Lock to Never (iPhone: Settings → Display 
 - **All photos** shows every photo for the home; **Details** shows the facts and description; **Play** runs a slideshow.
 - With a keyboard: arrow keys, Space (play), `i` (details), `g` (all photos), `f` (full screen), Esc (back).
 
+### Map
+
+**Map** (next to **Saved**) searches every home for sale in your agent's MLS, not just the saved search.
+
+- Pick a price range, a minimum number of bedrooms, and houses only or all homes. The map remembers these and where you left it.
+- Type a city, ZIP or street address and press **Go**, then pick a place to move the map there, or a home to jump straight to it.
+- Each pin shows a price; homes from your saved search are outlined in gold. Blue bubbles are groups of homes: tap one to zoom in.
+- Tap a pin for a summary card, then the card for photos. **Next home** then moves through the homes on the map.
+
+The map only covers the MLS your link belongs to, so other regions come up empty.
+
 On iPhone, Safari keeps its toolbars on screen. To get rid of them, use Share → **Add to Home Screen** and open it from the icon.
 
 ## Using a different link
 
 Tap **Change link** and paste the whole OneHome address from your agent's email. You can also take the OneHome link and swap `https://portal.onehome.com/en-US/properties/list` for this server's address, keeping everything from `?token=` on.
 
+The **Change link** button shows whether OneHome still accepts the link and when you added it; it turns amber when the link stops working. OneHome's emailed links carry no expiry date, so there is nothing to count down: a link lasts until OneHome stops accepting it. If a link ever does include an expiry, the button shows the time left instead.
+
 The link is saved in `config.json` next to `server.js`. That file is git-ignored: a link grants access to that search, so treat it like the email it came from. On first run there is no link yet, and the page asks you to paste one.
 
 ## How it works
 
 `server.js` exchanges the link's token for a OneHome session, reads the saved search and its homes, and passes photos through at `/img/<home>/<n>` (OneHome's own photo addresses expire after 30 minutes, so the server renews them as needed). It only reads; it never marks homes as viewed, liked or disliked.
+
+Two outside services are used by the map: map pictures come from OpenStreetMap's tile servers, and place names typed into the search box are looked up with OpenStreetMap's Nominatim geocoder. [Leaflet](https://leafletjs.com) 1.9.4 (BSD-2-Clause) is included in `public/`.
 
 ## Run it in Docker
 

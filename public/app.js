@@ -9,6 +9,9 @@
   const els = {
     grid: $('grid-view'), cards: $('cards'), gridStatus: $('grid-status'),
     searchName: $('search-name'), searchCount: $('search-count'), sort: $('sort'),
+    mapView: $('map-view'), mapResults: $('map-results'), mapCount: $('map-count'), mapCard: $('map-card'),
+    mapQuery: $('map-q'), fPrice: $('f-price'), fBeds: $('f-beds'), fType: $('f-type'),
+    linkPill: $('change-link'), linkStatus: $('link-status'),
     viewer: $('viewer'), photo: $('photo'), backdrop: $('backdrop'), photoStatus: $('photo-status'),
     price: $('v-price'), stats: $('v-stats'), address: $('v-address'),
     homeCount: $('v-home-count'), photoCount: $('v-photo-count'),
@@ -24,7 +27,8 @@
     homeId: null,
     photoIndex: 0,
     detail: null,
-    cameFromGrid: false,
+    nav: [],          // the homes Next/Prev home moves through
+    cameFromList: false,
     gridScroll: 0,
     loadToken: 0,
     timer: null,
@@ -154,7 +158,7 @@
 
   // ---------- viewer ----------
 
-  const homeIndex = () => state.order.findIndex((home) => home.id === state.homeId);
+  const homeIndex = () => state.nav.findIndex((home) => home.id === state.homeId);
 
   function writeHash() {
     const hash = `#/home/${encodeURIComponent(state.homeId)}/${state.photoIndex + 1}`;
@@ -163,25 +167,33 @@
 
   function openFromGrid(id) {
     state.gridScroll = window.scrollY;
-    state.cameFromGrid = true;
+    state.cameFromList = true;
+    state.nav = state.order;
+    $('back').textContent = '‹ All homes';
     location.hash = `#/home/${encodeURIComponent(id)}/1`;
   }
 
   function showViewer() {
     if (!els.viewer.hidden) return;
     els.grid.hidden = true;
+    els.mapView.hidden = true;
     els.viewer.hidden = false;
     els.viewer.classList.remove('clean');
     requestWakeLock();
   }
 
-  function showGrid() {
+  function leaveViewer() {
     stopSlideshow();
     closeSheets();
     releaseWakeLock();
     state.homeId = null;
     state.detail = null;
     els.viewer.hidden = true;
+  }
+
+  function showGrid() {
+    leaveViewer();
+    els.mapView.hidden = true;
     els.grid.hidden = false;
     window.scrollTo(0, state.gridScroll);
   }
@@ -191,7 +203,7 @@
     els.stats.textContent = statsLine(home);
     els.address.textContent = [home.street, home.cityLine].filter(Boolean).join(', ');
     const index = homeIndex();
-    els.homeCount.textContent = index >= 0 ? `Home ${index + 1} of ${state.order.length}` : '';
+    els.homeCount.textContent = index >= 0 ? `Home ${index + 1} of ${state.nav.length}` : '';
   }
 
   // `photo` is a zero-based index, or 'last'.
@@ -203,7 +215,9 @@
     state.detail = null;
     state.photoIndex = 0;
 
-    const summary = state.order.find((home) => home.id === id);
+    // A home opened from a bookmark or reload has no list behind it yet.
+    if (!state.nav.some((home) => home.id === id)) state.nav = state.order;
+    const summary = state.nav.find((home) => home.id === id);
     if (summary) renderHeadline(summary);
     els.photoCount.textContent = '';
     els.photo.classList.add('loading');
@@ -237,7 +251,7 @@
 
     // Warm up the neighbours so moving between homes is quick.
     const index = homeIndex();
-    for (const neighbour of [state.order[index + 1], state.order[index - 1]]) {
+    for (const neighbour of index >= 0 ? [state.nav[index + 1], state.nav[index - 1]] : []) {
       if (neighbour) getDetail(neighbour.id).catch(() => {});
     }
   }
@@ -276,7 +290,8 @@
   }
 
   function stepHome(direction, photo = 0) {
-    const next = state.order[homeIndex() + direction];
+    const index = homeIndex();
+    const next = index >= 0 ? state.nav[index + direction] : null;
     if (!next) {
       toast(direction > 0 ? 'That was the last home' : 'This is the first home');
       stopSlideshow();
@@ -465,16 +480,282 @@
     }
     els.dialog.close();
     detailCache.clear();
+    resetMap();
+    refreshLinkStatus();
     history.replaceState(null, '', '#/');
     showGrid();
     loadSearch();
+  }
+
+  // ---------- link status ----------
+
+  let linkInfo = null;
+
+  function ago(iso) {
+    const minutes = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
+    if (minutes < 2) return 'just now';
+    if (minutes < 60) return `${minutes} min ago`;
+    const hours = Math.round(minutes / 60);
+    if (hours < 24) return `${hours} hr ago`;
+    const days = Math.round(hours / 24);
+    return `${days} ${days === 1 ? 'day' : 'days'} ago`;
+  }
+
+  function timeLeft(ms) {
+    const minutes = Math.floor(ms / 60000);
+    if (minutes < 60) return `${Math.max(minutes, 1)} min`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 48) return `${hours} hr ${minutes % 60} min`;
+    return `${Math.floor(hours / 24)} days`;
+  }
+
+  function renderLinkStatus() {
+    const info = linkInfo;
+    let stateName = 'unknown';
+    let label = 'Checking link…';
+    if (info && !info.hasLink) {
+      stateName = 'warn';
+      label = 'No link yet · paste one';
+    } else if (info && info.ok === false) {
+      stateName = 'warn';
+      label = 'Stopped working · paste a new one';
+    } else if (info && info.expiresAt) {
+      const left = new Date(info.expiresAt).getTime() - Date.now();
+      stateName = left < 60 * 60000 ? 'warn' : 'ok';
+      label = left <= 0 ? 'Expired · paste a new one' : `Expires in ${timeLeft(left)}`;
+    } else if (info && info.ok) {
+      stateName = 'ok';
+      label = info.savedAt ? `Working · added ${ago(info.savedAt)}` : 'Working';
+    } else if (info) {
+      label = 'Not checked yet';
+    }
+    els.linkPill.dataset.state = stateName;
+    els.linkStatus.textContent = label;
+    els.linkPill.title = info?.checkedAt ? `Last checked with OneHome ${ago(info.checkedAt)}` : '';
+  }
+
+  async function refreshLinkStatus() {
+    try { linkInfo = await getJson('/api/link/status'); } catch {}
+    renderLinkStatus();
+  }
+
+  // ---------- map ----------
+
+  const MAP_STORE = 'onehome-map';
+  const mapState = { map: null, layer: null, pins: [], selectedId: null, token: 0, timer: null };
+
+  function readStore() {
+    try { return JSON.parse(localStorage.getItem(MAP_STORE)) || {}; } catch { return {}; }
+  }
+  function writeStore() {
+    const { map } = mapState;
+    if (!map) return;
+    const center = map.getCenter();
+    const saved = { lat: center.lat, lng: center.lng, zoom: map.getZoom(), price: els.fPrice.value, beds: els.fBeds.value, type: els.fType.value };
+    try { localStorage.setItem(MAP_STORE, JSON.stringify(saved)); } catch {}
+  }
+
+  function priceTag(value) {
+    if (typeof value !== 'number') return '—';
+    if (value >= 1e6) return `$${(value / 1e6).toFixed(2).replace(/\.?0+$/, '')}M`;
+    return `$${Math.round(value / 1000)}k`;
+  }
+
+  function initMap() {
+    if (mapState.map) return;
+    const stored = readStore();
+    for (const [select, value] of [[els.fPrice, stored.price], [els.fBeds, stored.beds], [els.fType, stored.type]]) {
+      if (value && [...select.options].some((option) => option.value === value)) select.value = value;
+    }
+    const map = L.map('map', { zoomControl: false, worldCopyJump: true, minZoom: 4, maxZoom: 19 });
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      maxZoom: 19,
+    }).addTo(map);
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
+    mapState.map = map;
+    mapState.layer = L.layerGroup().addTo(map);
+
+    const savedSpots = state.homes.filter((home) => typeof home.lat === 'number' && typeof home.lng === 'number');
+    if (typeof stored.lat === 'number' && typeof stored.lng === 'number') map.setView([stored.lat, stored.lng], stored.zoom || 12);
+    else if (savedSpots.length) map.fitBounds(savedSpots.map((home) => [home.lat, home.lng]), { padding: [40, 40], maxZoom: 14 });
+    else map.setView([39.5, -98.35], 4);
+
+    map.on('moveend', () => { writeStore(); scheduleMapLoad(); });
+    map.on('click', () => { els.mapResults.hidden = true; closeMapCard(); });
+    scheduleMapLoad();
+  }
+
+  function showMap() {
+    leaveViewer();
+    els.grid.hidden = true;
+    els.mapView.hidden = false;
+    initMap();
+    // Leaflet measures its box once; it was hidden while the viewer was open.
+    mapState.map.invalidateSize();
+  }
+
+  function resetMap() {
+    mapState.pins = [];
+    mapState.selectedId = null;
+    mapState.layer?.clearLayers();
+    els.mapCard.hidden = true;
+    els.mapCount.textContent = '';
+    if (mapState.map) scheduleMapLoad();
+  }
+
+  function scheduleMapLoad() {
+    clearTimeout(mapState.timer);
+    mapState.timer = setTimeout(loadPins, 300);
+  }
+
+  async function loadPins() {
+    const { map } = mapState;
+    if (!map || els.mapView.hidden) return;
+    const bounds = map.getBounds();
+    const [min, max] = els.fPrice.value.split('-');
+    const params = new URLSearchParams({
+      s: bounds.getSouth(), w: bounds.getWest(), n: bounds.getNorth(), e: bounds.getEast(),
+      // One level deeper than the screen, so more homes show as prices rather than bubbles.
+      zoom: map.getZoom() + 1,
+      type: els.fType.value,
+    });
+    if (min) params.set('min', min);
+    if (max) params.set('max', max);
+    if (els.fBeds.value) params.set('beds', els.fBeds.value);
+
+    const token = ++mapState.token;
+    els.mapCount.textContent = 'Looking for homes…';
+    let data;
+    try {
+      data = await getJson(`/api/map?${params}`);
+    } catch (err) {
+      if (token === mapState.token) els.mapCount.textContent = `Could not load homes: ${err.message}`;
+      return;
+    }
+    if (token !== mapState.token) return;
+    mapState.pins = data.pins;
+    drawPins();
+    const grouped = data.pins.some((pin) => pin.cluster);
+    els.mapCount.textContent = !data.total ? 'No homes here with these filters'
+      : `${num.format(data.total)} ${data.total === 1 ? 'home' : 'homes'}${grouped ? ' · zoom in to see each one' : ''}`;
+  }
+
+  function drawPins() {
+    const { map, layer } = mapState;
+    const savedIds = new Set(state.homes.map((home) => home.id));
+    layer.clearLayers();
+    for (const pin of mapState.pins) {
+      let classes = 'pin';
+      let label;
+      if (pin.cluster) {
+        classes += ' pin-cluster';
+        label = num.format(pin.count);
+      } else {
+        if (pin.ids.some((id) => savedIds.has(id))) classes += ' pin-saved';
+        if (pin.ids.includes(mapState.selectedId)) classes += ' pin-selected';
+        label = pin.ids.length > 1 ? `${priceTag(pin.price)} ×${pin.ids.length}` : priceTag(pin.price);
+      }
+      const icon = L.divIcon({ className: classes, html: h('span', null, label), iconSize: null });
+      const marker = L.marker([pin.lat, pin.lng], { icon, keyboard: false, zIndexOffset: pin.cluster ? 0 : 500 });
+      marker.on('click', () => {
+        if (pin.cluster) { map.setView([pin.lat, pin.lng], Math.min(map.getZoom() + 2, 18)); return; }
+        // Several homes can share one spot; tapping again steps through them.
+        const at = pin.ids.indexOf(mapState.selectedId);
+        selectOnMap(pin.ids[(at + 1) % pin.ids.length], pin.price);
+      });
+      layer.addLayer(marker);
+    }
+  }
+
+  function closeMapCard() {
+    if (els.mapCard.hidden) return;
+    els.mapCard.hidden = true;
+    mapState.selectedId = null;
+    drawPins();
+  }
+
+  async function selectOnMap(id, price) {
+    mapState.selectedId = id;
+    drawPins();
+    const fill = (home, loaded) => {
+      const picture = loaded && home.photos?.length
+        ? h('img', { src: imgUrl(id, 0), alt: '' })
+        : h('div', { class: 'no-photo' });
+      els.mapCard.replaceChildren(
+        h('button', { class: 'map-card-open', type: 'button', onclick: () => openFromMap(id) },
+          picture,
+          h('div', { class: 'map-card-text' },
+            h('div', { class: 'map-card-price' }, money(home.price)),
+            h('div', { class: 'map-card-stats' }, loaded ? statsLine(home) : 'Loading…'),
+            h('div', { class: 'map-card-address' }, loaded ? [home.street, home.cityLine].filter(Boolean).join(', ') : ''),
+            h('div', { class: 'map-card-cta' }, 'View photos ›'))),
+        h('button', { class: 'map-card-close', type: 'button', 'aria-label': 'Close', onclick: closeMapCard }, '✕'));
+      els.mapCard.hidden = false;
+    };
+    fill({ price }, false);
+    try {
+      const detail = await getDetail(id);
+      if (mapState.selectedId === id) fill(detail, true);
+      return detail;
+    } catch (err) {
+      if (mapState.selectedId === id) els.mapCard.querySelector('.map-card-stats').textContent = `Could not load: ${err.message}`;
+      return null;
+    }
+  }
+
+  function openFromMap(id) {
+    const homes = mapState.pins.filter((pin) => !pin.cluster)
+      .flatMap((pin) => pin.ids.map((pinId) => ({ id: pinId, price: pin.price })))
+      .sort((a, b) => (b.price || 0) - (a.price || 0));
+    if (!homes.some((home) => home.id === id)) homes.unshift({ id });
+    state.nav = homes;
+    state.cameFromList = true;
+    $('back').textContent = '‹ Map';
+    location.hash = `#/home/${encodeURIComponent(id)}/1`;
+  }
+
+  async function searchMap(event) {
+    event.preventDefault();
+    const query = els.mapQuery.value.trim();
+    if (query.length < 2) return;
+    els.mapQuery.blur();
+    els.mapResults.replaceChildren(h('p', null, 'Searching…'));
+    els.mapResults.hidden = false;
+    let found;
+    try {
+      found = await getJson(`/api/lookup?q=${encodeURIComponent(query)}`);
+    } catch (err) {
+      els.mapResults.replaceChildren(h('p', null, `Search did not work: ${err.message}`));
+      return;
+    }
+    const { map } = mapState;
+    const places = found.places.map((place) => h('button', { class: 'result', type: 'button', onclick: () => {
+      els.mapResults.hidden = true;
+      const b = place.bounds;
+      if ([b.south, b.west, b.north, b.east].every(Number.isFinite)) map.fitBounds([[b.south, b.west], [b.north, b.east]], { maxZoom: 16 });
+      else map.setView([place.lat, place.lng], 13);
+    } }, h('b', null, place.name.split(',')[0]), h('span', null, place.name.split(',').slice(1).join(',').trim())));
+    const homes = found.homes.map((home) => h('button', { class: 'result', type: 'button', onclick: async () => {
+      els.mapResults.hidden = true;
+      const detail = await selectOnMap(home.id, home.price);
+      if (detail && typeof detail.lat === 'number' && typeof detail.lng === 'number') map.setView([detail.lat, detail.lng], 16);
+    } }, h('b', null, home.street || 'Home'), h('span', null, [money(home.price), home.cityLine].filter(Boolean).join(' · '))));
+    els.mapResults.replaceChildren(
+      ...(places.length ? [h('h3', null, 'Places'), ...places] : []),
+      ...(homes.length ? [h('h3', null, 'Homes for sale'), ...homes] : []),
+      !places.length && !homes.length && h('p', null, `Nothing found for “${query}”.`),
+    );
   }
 
   // ---------- routing and input ----------
 
   function route() {
     const match = location.hash.match(/^#\/home\/([^/]+)(?:\/(\d+))?/);
-    if (!match) { showGrid(); return; }
+    if (!match) {
+      if (location.hash.startsWith('#/map')) showMap(); else showGrid();
+      return;
+    }
     const id = decodeURIComponent(match[1]);
     const index = Math.max((Number(match[2]) || 1) - 1, 0);
     if (id === state.homeId && state.detail) {
@@ -485,7 +766,7 @@
   }
 
   function goBack() {
-    if (state.cameFromGrid) { state.cameFromGrid = false; history.back(); return; }
+    if (state.cameFromList) { state.cameFromList = false; history.back(); return; }
     history.replaceState(null, '', '#/');
     showGrid();
   }
@@ -560,14 +841,23 @@
   });
 
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && !els.viewer.hidden) requestWakeLock();
+    if (document.visibilityState !== 'visible') return;
+    if (!els.viewer.hidden) requestWakeLock();
+    refreshLinkStatus();
   });
 
   els.sort.addEventListener('change', () => { sortHomes(); renderCards(); });
   $('change-link').addEventListener('click', () => showLinkDialog('Paste the link your agent sent you (the whole address, including ?token=…).'));
   $('link-cancel').addEventListener('click', () => els.dialog.close());
   $('link-form').addEventListener('submit', submitLink);
+  $('map-search').addEventListener('submit', searchMap);
+  for (const select of [els.fPrice, els.fBeds, els.fType]) {
+    select.addEventListener('change', () => { writeStore(); closeMapCard(); scheduleMapLoad(); });
+  }
+  setInterval(refreshLinkStatus, 60000);
+  setInterval(renderLinkStatus, 30000);
   window.addEventListener('hashchange', route);
 
   loadSearch().then(route);
+  refreshLinkStatus();
 })();
