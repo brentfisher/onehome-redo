@@ -1,0 +1,13 @@
+{
+  "name": "onehome-bigscreen",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Landscape, cast-friendly viewer for a OneHome saved search",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

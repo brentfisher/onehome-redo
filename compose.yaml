@@ -1,0 +1,11 @@
+services:
+  onehome:
+    build: .
+    ports:
+      - "3210:3210"
+    volumes:
+      - onehome-data:/data
+    restart: unless-stopped
+
+volumes:
+  onehome-data:

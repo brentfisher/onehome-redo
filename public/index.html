@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Homes">
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg">
+<link rel="apple-touch-icon" href="/icon.svg">
+<title>Homes</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<main id="grid-view">
+  <header class="topbar">
+    <div class="topbar-title">
+      <h1 id="search-name">Homes</h1>
+      <p id="search-count"></p>
+    </div>
+    <div class="topbar-actions">
+      <select id="sort" aria-label="Sort homes">
+        <option value="agent">Agent's order</option>
+        <option value="price-desc">Price: high to low</option>
+        <option value="price-asc">Price: low to high</option>
+        <option value="sqft-desc">Largest first</option>
+      </select>
+      <button id="change-link" type="button" class="pill">Change link</button>
+    </div>
+  </header>
+  <p id="grid-status" class="status" role="status">Loading homes…</p>
+  <div id="cards" class="cards"></div>
+</main>
+
+<section id="viewer" hidden>
+  <div id="backdrop" class="backdrop"></div>
+  <img id="photo" class="photo" alt="">
+  <p id="photo-status" class="photo-status" role="status" hidden></p>
+
+  <button class="zone zone-prev" id="zone-prev" type="button" aria-label="Previous photo"><span>‹</span></button>
+  <button class="zone zone-mid" id="zone-mid" type="button" aria-label="Show or hide controls"></button>
+  <button class="zone zone-next" id="zone-next" type="button" aria-label="Next photo"><span>›</span></button>
+
+  <div class="hud hud-top">
+    <button id="back" type="button" class="pill">‹ All homes</button>
+    <div class="headline">
+      <div class="headline-main"><span id="v-price"></span><span id="v-stats"></span></div>
+      <div class="headline-sub" id="v-address"></div>
+    </div>
+    <div class="counter" id="v-home-count"></div>
+  </div>
+
+  <div class="hud hud-bottom">
+    <button id="prev-home" type="button" class="pill">⏮ Prev home</button>
+    <button id="toggle-photos" type="button" class="pill">All photos</button>
+    <div class="counter counter-big" id="v-photo-count"></div>
+    <button id="toggle-play" type="button" class="pill">▶ Play</button>
+    <button id="toggle-details" type="button" class="pill">Details</button>
+    <button id="fullscreen" type="button" class="pill" hidden>⛶ Full screen</button>
+    <button id="next-home" type="button" class="pill">Next home ⏭</button>
+  </div>
+
+  <aside id="details" class="sheet sheet-side" hidden>
+    <button type="button" class="pill sheet-close" data-close>Close ✕</button>
+    <div id="details-body"></div>
+  </aside>
+
+  <div id="photos" class="sheet sheet-full" hidden>
+    <button type="button" class="pill sheet-close" data-close>Close ✕</button>
+    <div id="photos-body" class="thumbs"></div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+</section>
+
+<dialog id="link-dialog">
+  <form id="link-form" method="dialog">
+    <h2>Open a OneHome link</h2>
+    <p id="link-message">Paste the link your agent sent you (the whole address, including <code>?token=…</code>).</p>
+    <textarea id="link-input" rows="4" placeholder="https://portal.onehome.com/en-US/properties/list?token=…&amp;searchId=…" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
+    <p id="link-error" class="error" hidden></p>
+    <div class="dialog-actions">
+      <button type="button" id="link-cancel" class="pill">Cancel</button>
+      <button type="submit" class="pill pill-primary">Open</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>

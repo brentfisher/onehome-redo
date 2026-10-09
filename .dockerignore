@@ -1,0 +1,8 @@
+config.json
+README.md
+Dockerfile
+compose.yaml
+.dockerignore
+.claude
+.git
+node_modules
