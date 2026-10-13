@@ -40,6 +40,7 @@
     wakeLock: null,
   };
   const detailCache = new Map();
+  const historyCache = new Map(); // id -> promise of that home's sale history
 
   // ---------- helpers ----------
 
@@ -305,6 +306,9 @@
     const summary = state.nav.find((home) => home.id === id);
     if (summary) renderHeadline(summary);
     els.photoCount.textContent = '';
+    state.history = null;
+    $('v-flip').hidden = true;
+    loadHistory(id);
     els.photo.classList.add('loading');
     els.photoStatus.textContent = 'Loading photos…';
     els.photoStatus.hidden = false;
@@ -339,6 +343,51 @@
     for (const neighbour of index >= 0 ? [state.nav[index + 1], state.nav[index - 1]] : []) {
       if (neighbour) getDetail(neighbour.id).catch(() => {});
     }
+  }
+
+  // Sale history arrives after the photos; it fills in the FLIP badge and the
+  // history section if Details is already open.
+  function loadHistory(id) {
+    if (!historyCache.has(id)) {
+      const promise = getJson(`/api/history/${encodeURIComponent(id)}`);
+      historyCache.set(id, promise);
+      promise.catch(() => historyCache.delete(id));
+    }
+    historyCache.get(id).then(
+      (history) => {
+        if (state.homeId !== id) return;
+        state.history = history;
+        $('v-flip').hidden = !history.flip;
+        if (!els.details.hidden) renderDetails();
+      },
+      () => {
+        if (state.homeId !== id) return;
+        state.history = { failed: true, records: [] };
+        if (!els.details.hidden) renderDetails();
+      },
+    );
+  }
+
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  // Record dates come as YYYY, YYYY-MM or YYYY-MM-DD.
+  function recordDate(text) {
+    const [year, month, day] = text.split('-');
+    if (!month) return year;
+    return `${MONTHS[Number(month) - 1]} ${day ? `${Number(day)}, ` : ''}${year}`;
+  }
+
+  function historySection() {
+    const history = state.history;
+    if (!history) return h('p', { class: 'history-note' }, 'Loading sale records…');
+    if (history.failed) return h('p', { class: 'history-note' }, 'Sale records could not be loaded.');
+    if (!history.records.length) return h('p', { class: 'history-note' }, 'No public sale records were found for this home.');
+    return [
+      h('table', { class: 'history' }, history.records.map((record) => h('tr', null,
+        h('td', null, recordDate(record.date)),
+        h('td', null, record.price ? money(record.price) : '—'),
+        h('td', null, record.marketSale ? 'Sold' : `Transfer, not a market sale${record.deed ? ` (${record.deed})` : ''}`)))),
+      h('p', { class: 'history-note' }, 'From county records. Transfers between family, trusts or lenders usually show no price.'),
+    ];
   }
 
   function showPhoto(index) {
@@ -423,11 +472,14 @@
       : d.baths;
     const hoa = isSet(p.AssociationFee) ? `${money(p.AssociationFee)}${p.AssociationFeeFrequency ? ` ${String(p.AssociationFeeFrequency).toLowerCase()}` : ''}` : null;
     const taxes = isSet(p.TaxAnnualAmount) ? `${money(p.TaxAnnualAmount)}${p.TaxYear ? ` (${p.TaxYear})` : ''}` : null;
+    const flip = state.history?.flip;
     const place = [d.street, d.cityLine].filter(Boolean).join(', ') || `${d.lat},${d.lng}`;
     const lot = isSet(d.lot) ? `${text(d.lot)} ${d.lotUnits || ''}`.trim() : null;
 
     els.detailsBody.replaceChildren(
-      h('h2', null, money(d.price)),
+      h('h2', null, money(d.price), flip && h('span', { class: 'flip-badge' }, 'FLIP')),
+      ...(flip ? [h('p', { class: 'flip-note' },
+        `Bought ${recordDate(flip.purchaseDate)} for ${money(flip.purchasePrice)}, listed ${flip.increasePercent}% higher ${flip.monthsHeld < 1 ? 'the same month' : `${flip.monthsHeld} ${flip.monthsHeld === 1 ? 'month' : 'months'} later`}.`)] : []),
       h('p', { class: 'where' }, [d.street, d.cityLine].filter(Boolean).join(', ')),
       h('p', { class: 'link-row' },
         h('a', { class: 'pill', target: '_blank', rel: 'noopener', href: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(place)}` }, 'Google Maps ↗'),
@@ -439,6 +491,8 @@
         ['Elementary', p.ElementarySchool],
         ['County', d.county],
       ])),
+      h('h3', null, 'Purchase history'),
+      ...[historySection()].flat(),
       ...section('The basics', factList([
         ['Status', d.status],
         ['Bedrooms', d.beds],
@@ -478,7 +532,6 @@
         ['Listed by', [p.ListAgentFullName, p.ListOfficeName].filter(Boolean).join(', ')],
       ])),
     );
-    els.details.scrollTop = 0;
   }
 
   function markCurrentThumb() {
@@ -506,7 +559,7 @@
     stopSlideshow();
     sheet.hidden = false;
     $(`toggle-${name}`).setAttribute('aria-pressed', 'true');
-    if (name === 'details') renderDetails(); else renderPhotoSheet();
+    if (name === 'details') { renderDetails(); els.details.scrollTop = 0; } else renderPhotoSheet();
   }
 
   // ---------- slideshow, full screen, wake lock ----------
@@ -571,6 +624,7 @@
     }
     els.dialog.close();
     detailCache.clear();
+    historyCache.clear();
     resetMap();
     refreshLinkStatus();
     history.replaceState(null, '', '#/');

@@ -19,6 +19,11 @@ const UPSTREAM_TIMEOUT_MS = 20000;
 const MEDIA_TTL_MS = 20 * 60 * 1000;
 const SEARCH_TTL_MS = 5 * 60 * 1000;
 const LINK_CHECK_MS = 10 * 60 * 1000;
+const HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
+// A home is marked FLIP when its last market sale was within this many months
+// before it was listed, and it is listed at least this much above that price.
+const FLIP_MONTHS = Number(process.env.FLIP_MONTHS) || 12;
+const FLIP_MIN_INCREASE = (Number(process.env.FLIP_MIN_INCREASE_PERCENT) || 20) / 100;
 const GEOCODER = 'https://nominatim.openstreetmap.org/search';
 const GEOCODER_UA = 'onehome-bigscreen/1.0 (+https://github.com/brentfisher/onehome-redo)';
 
@@ -29,6 +34,7 @@ let linkCheck = { ok: null, at: 0, error: null };
 let sessionPromise = null;
 const searches = new Map(); // searchId -> { at, data } | { promise }
 const schoolCache = new Map();
+const histories = new Map(); // listingId -> { at, data }
 let likes = loadLikes(); // listingId -> summary
 const details = new Map(); // listingId -> { at, data } | { promise }
 
@@ -64,6 +70,7 @@ function setLink(next) {
   sessionPromise = null;
   searches.clear();
   schoolCache.clear();
+  histories.clear();
   details.clear();
   saveLink();
 }
@@ -284,8 +291,9 @@ const DETAIL_QUERY = `query($listingId: String!, $groupId: String!) {
       TaxAnnualAmount TaxYear
       ElementarySchool MiddleOrJuniorSchool HighSchool
       PublicRemarks ListOfficeName ListAgentFullName
+      ParcelNumber ListingContractDate
     }
-    customProperty { LivingAreaRange }
+    customProperty { LivingAreaRange FIPSCode }
     media { ShortDescription LongDescription MediaType Order Image { ${IMAGE_FIELDS} } }
     floorPlans { ShortDescription LongDescription MediaType Order Image { ${IMAGE_FIELDS} } }
   }
@@ -405,6 +413,7 @@ async function fetchDetail(id) {
   return {
     ...summarize(listingDetail),
     property: p,
+    customFips: listingDetail.customProperty?.FIPSCode || null,
     photos: [...photoList(listingDetail.media, 'photo'), ...photoList(listingDetail.floorPlans, 'floorplan')],
   };
 }
@@ -578,6 +587,100 @@ async function lookup(query) {
   };
 }
 
+const HISTORY_QUERY = `query($fipsCode: String!, $parcelId: String!, $listingId: String, $groupId: String) {
+  prdById(prdId: {fipsCode: $fipsCode, parcelId: $parcelId}, listingId: $listingId, groupId: $groupId) {
+    searchResultData {
+      propertySummaryList {
+        propertyData { sevaxShistSaleDate sevaxShistRecordingDate actSevaxShistSalePrice sevaxShistNominalInd shistPrimaryCategoryCode }
+        propertyCodeData { sevaxShistDocumentType }
+      }
+    }
+  }
+}`;
+
+const DEED_TYPES = {
+  WD: 'Warranty deed', LM: 'Limited warranty deed', SW: 'Special warranty deed', QC: 'Quitclaim deed',
+  DD: 'Deed', GD: 'Grant deed', TD: 'Trustee’s deed', EX: 'Executor’s deed', AD: 'Administrator’s deed',
+  SU: 'Survivorship deed', FD: 'Foreclosure deed', AF: 'Affidavit',
+};
+
+// County records write dates as YYYYMMDD, with 00 for an unknown month or day.
+function recordDate(raw) {
+  const match = /^(\d{4})(\d{2})(\d{2})$/.exec(raw || '');
+  if (!match || match[1] === '0000') return null;
+  const [, year, month, day] = match;
+  if (month === '00') return year;
+  return day === '00' ? `${year}-${month}` : `${year}-${month}-${day}`;
+}
+
+// The record holds each column as one comma-separated string, newest first.
+function saleRecords(summary) {
+  const column = (text) => (text ? String(text).split(',').map((value) => value.trim()) : []);
+  const data = summary.propertyData || {};
+  const sold = column(data.sevaxShistSaleDate);
+  const recorded = column(data.sevaxShistRecordingDate);
+  const prices = column(data.actSevaxShistSalePrice);
+  const nominal = column(data.sevaxShistNominalInd);
+  const category = column(data.shistPrimaryCategoryCode);
+  const deeds = column(summary.propertyCodeData?.sevaxShistDocumentType);
+  const records = [];
+  for (let i = 0; i < Math.max(sold.length, recorded.length); i++) {
+    const date = recordDate(sold[i]) || recordDate(recorded[i]);
+    if (!date) continue;
+    const price = Number(prices[i]) || null;
+    records.push({
+      date,
+      price,
+      deed: DEED_TYPES[deeds[i]] || deeds[i] || null,
+      // A market sale: priced, not a token amount, and between unrelated parties.
+      marketSale: Boolean(price) && nominal[i] !== 'Y' && category[i] === 'A',
+    });
+  }
+  return records.sort((a, b) => b.date.localeCompare(a.date));
+}
+
+function monthsBetween(from, to) {
+  return (to.getFullYear() - from.getFullYear()) * 12 + (to.getMonth() - from.getMonth()) - (to.getDate() < from.getDate() ? 1 : 0);
+}
+
+function findFlip(records, listPrice, listedOn) {
+  const purchase = records.find((record) => record.marketSale);
+  if (!purchase || purchase.date.length < 10 || typeof listPrice !== 'number') return null;
+  const bought = new Date(`${purchase.date}T00:00:00`);
+  const listed = listedOn ? new Date(`${listedOn}T00:00:00`) : new Date();
+  if (Number.isNaN(listed.getTime()) || bought > listed) return null;
+  const monthsHeld = monthsBetween(bought, listed);
+  const increase = (listPrice - purchase.price) / purchase.price;
+  if (monthsHeld >= FLIP_MONTHS || increase < FLIP_MIN_INCREASE) return null;
+  return { purchaseDate: purchase.date, purchasePrice: purchase.price, monthsHeld, increasePercent: Math.round(increase * 100) };
+}
+
+async function fetchHistory(id) {
+  const detail = await getDetail(id);
+  const parcelId = detail.property.ParcelNumber;
+  const fipsCode = detail.customFips;
+  if (!parcelId || !fipsCode) return { available: false, records: [], flip: null };
+  const data = await gql(HISTORY_QUERY, (s) => ({ fipsCode, parcelId, listingId: id, groupId: s.groupID }));
+  const summary = data.prdById?.searchResultData?.propertySummaryList?.[0];
+  if (!summary) return { available: false, records: [], flip: null };
+  const records = saleRecords(summary);
+  return {
+    available: true,
+    records,
+    flip: findFlip(records, detail.price, detail.property.ListingContractDate),
+    rule: { months: FLIP_MONTHS, increasePercent: Math.round(FLIP_MIN_INCREASE * 100) },
+  };
+}
+
+async function getHistory(id) {
+  const cached = histories.get(id);
+  if (cached && Date.now() - cached.at < HISTORY_TTL_MS) return cached.data;
+  const data = await fetchHistory(id);
+  if (histories.size > 500) histories.clear();
+  histories.set(id, { at: Date.now(), data });
+  return data;
+}
+
 function sendJson(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(JSON.stringify(body));
@@ -653,7 +756,7 @@ async function route(req, res) {
     const id = parts[2];
     if (req.method === 'PUT') {
       // The server looks the home up itself, so the page cannot store made-up details.
-      const { property: _property, photos: _photos, ...summary } = await getDetail(id);
+      const { property: _property, photos: _photos, customFips: _fips, ...summary } = await getDetail(id);
       likes[id] = { ...summary, likedAt: likes[id]?.likedAt || new Date().toISOString() };
       saveLikes();
       return sendJson(res, 200, { homes: likedHomes() });
@@ -683,10 +786,12 @@ async function route(req, res) {
     if (query.length < 2) return sendJson(res, 400, { error: 'Type at least two characters' });
     return sendJson(res, 200, await lookup(query));
   }
+  if (parts[0] === 'api' && parts[1] === 'history' && parts[2]) return sendJson(res, 200, await getHistory(parts[2]));
   if (parts[0] === 'api' && parts[1] === 'listing' && parts[2]) {
     const detail = await getDetail(parts[2]);
     // Photo addresses stay on the server; the page asks for /img/<id>/<n>.
-    return sendJson(res, 200, { ...detail, photos: detail.photos.map(({ url: _url, ...rest }) => rest) });
+    const { customFips: _fips, ...shown } = detail;
+    return sendJson(res, 200, { ...shown, photos: detail.photos.map(({ url: _url, ...rest }) => rest) });
   }
   if (parts[0] === 'img' && parts[1] && /^\d+$/.test(parts[2] || '')) return sendImage(res, parts[1], Number(parts[2]));
 

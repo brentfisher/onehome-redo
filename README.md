@@ -47,7 +47,17 @@ The map only covers the MLS your link belongs to, so other regions come up empty
 
 On iPhone, Safari keeps its toolbars on screen. To get rid of them, use Share → **Add to Home Screen** and open it from the icon.
 
-## Likes
+## Purchase history and FLIP
+
+**Details** lists the home's past sales and transfers from county records, newest first. Transfers with no price (between family, trusts or lenders) are shown but not treated as sales.
+
+A home is marked **FLIP**, next to its price, when both of these are true:
+
+- its most recent market sale was less than 12 months before it was listed, and
+- it is listed at least 20% above that sale price.
+
+To change the rule, start the server with other numbers, for example `FLIP_MONTHS=24 FLIP_MIN_INCREASE_PERCENT=25 node server.js`. Some homes have no county record attached, and those show no history.
+
 
 Likes are kept in `likes.json` next to `config.json`, on the machine running the server, so every phone and computer using this server sees the same list. They are not sent to OneHome, and your agent does not see them.
 
