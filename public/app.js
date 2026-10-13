@@ -10,7 +10,8 @@
     grid: $('grid-view'), cards: $('cards'), gridStatus: $('grid-status'),
     searchName: $('search-name'), searchCount: $('search-count'), sort: $('sort'),
     mapView: $('map-view'), mapResults: $('map-results'), mapCount: $('map-count'), mapCard: $('map-card'),
-    mapQuery: $('map-q'), fPrice: $('f-price'), fBeds: $('f-beds'), fType: $('f-type'),
+    mapQuery: $('map-q'), fPrice: $('f-price'), fBeds: $('f-beds'), fSchool: $('f-school'),
+    searchPick: $('search-pick'), like: $('toggle-like'), mapBar: document.querySelector('.mapbar'),
     linkPill: $('change-link'), linkStatus: $('link-status'),
     viewer: $('viewer'), photo: $('photo'), backdrop: $('backdrop'), photoStatus: $('photo-status'),
     price: $('v-price'), stats: $('v-stats'), address: $('v-address'),
@@ -27,6 +28,9 @@
     homeId: null,
     photoIndex: 0,
     detail: null,
+    likes: new Map(), // id -> summary of each liked home
+    view: 'saved',    // which list the grid shows: 'saved' or 'liked'
+    searchName: 'Homes',
     nav: [],          // the homes Next/Prev home moves through
     cameFromList: false,
     gridScroll: 0,
@@ -108,43 +112,120 @@
       if (x === null || y === null) return (x === null) - (y === null);
       return (x - y) * dir;
     };
-    const homes = [...state.homes];
+    const homes = state.view === 'liked' ? [...state.likes.values()] : [...state.homes];
     if (mode === 'price-desc') homes.sort(by('price', -1));
     else if (mode === 'price-asc') homes.sort(by('price', 1));
     else if (mode === 'sqft-desc') homes.sort(by('sqft', -1));
     state.order = homes;
   }
 
+  function heartButton(id) {
+    const liked = state.likes.has(id);
+    return h('button', {
+      class: 'heart', type: 'button', 'data-like': id, 'aria-pressed': String(liked),
+      'aria-label': liked ? 'Unlike this home' : 'Like this home',
+      onclick: (event) => { event.stopPropagation(); toggleLike(id); },
+    }, liked ? '♥' : '♡');
+  }
+
+  function schoolLine(home) {
+    return [home.highSchool && `${home.highSchool} HS`, home.county && `${home.county} County`].filter(Boolean).join(' · ');
+  }
+
   function renderCards() {
     els.cards.replaceChildren(...state.order.map((home) => {
       const img = h('img', { src: imgUrl(home.id, 0), alt: '', loading: 'lazy', decoding: 'async' });
       img.addEventListener('error', () => img.remove());
-      return h('button', { class: 'card', type: 'button', onclick: () => openFromGrid(home.id) },
+      const open = () => openFromGrid(home.id);
+      return h('div', { class: 'card', role: 'button', tabindex: '0', onclick: open,
+        onkeydown: (event) => { if (event.key === 'Enter' && event.target === event.currentTarget) open(); } },
         img,
         isSet(home.status) && h('span', { class: home.status === 'Active' ? 'badge' : 'badge other' }, home.status),
+        heartButton(home.id),
         h('div', { class: 'card-body' },
           h('div', { class: 'card-top' },
             h('span', { class: 'card-price' }, money(home.price)),
             h('span', { class: 'card-stats' }, statsLine(home))),
-          h('div', { class: 'card-address' }, [home.street, home.cityLine].filter(Boolean).join(', '))));
+          h('div', { class: 'card-address' }, [home.street, home.cityLine].filter(Boolean).join(', ')),
+          schoolLine(home) && h('div', { class: 'card-school' }, schoolLine(home))));
     }));
   }
 
-  async function loadSearch() {
+  // Shows whichever list the grid is on, with its title and count.
+  function renderGrid() {
+    const liked = state.view === 'liked';
+    sortHomes();
+    renderCards();
+    els.searchName.textContent = liked ? 'Liked homes' : state.searchName;
+    els.searchCount.textContent = `${state.order.length} ${state.order.length === 1 ? 'home' : 'homes'}`;
+    els.searchPick.hidden = liked || els.searchPick.options.length < 2;
+    for (const a of document.querySelectorAll('#grid-switch a')) {
+      if (a.getAttribute('href') === (liked ? '#/liked' : '#/')) a.setAttribute('aria-current', 'page');
+      else a.removeAttribute('aria-current');
+    }
+    if (els.gridStatus.classList.contains('error') && !liked) return;
+    els.gridStatus.className = 'status';
+    els.gridStatus.hidden = state.order.length > 0;
+    els.gridStatus.textContent = liked ? 'No liked homes yet. Tap ♡ on any home to keep it here.' : 'This search has no homes right now.';
+  }
+
+  // ---------- likes ----------
+
+  function setLikes(homes) {
+    state.likes = new Map(homes.map((home) => [home.id, home]));
+  }
+
+  async function loadLikes() {
+    try { setLikes((await getJson('/api/likes')).homes); } catch {}
+    paintLikes();
+  }
+
+  // Brings every heart on screen in line with the list of liked homes.
+  function paintLikes() {
+    for (const button of document.querySelectorAll('[data-like]')) {
+      const liked = state.likes.has(button.dataset.like);
+      button.setAttribute('aria-pressed', String(liked));
+      button.setAttribute('aria-label', liked ? 'Unlike this home' : 'Like this home');
+      button.textContent = liked ? '♥' : '♡';
+    }
+    const liked = state.likes.has(state.homeId);
+    els.like.setAttribute('aria-pressed', String(liked));
+    els.like.textContent = liked ? '♥ Liked' : '♡ Like';
+    if (state.view === 'liked' && !els.grid.hidden) renderGrid();
+    if (mapState.map && !els.mapView.hidden) drawPins();
+  }
+
+  async function toggleLike(id) {
+    if (!id) return;
+    const liked = state.likes.has(id);
+    try {
+      setLikes((await getJson(`/api/likes/${encodeURIComponent(id)}`, { method: liked ? 'DELETE' : 'PUT' })).homes);
+    } catch (err) {
+      if (!els.viewer.hidden) toast(`Could not save: ${err.message}`);
+      return;
+    }
+    paintLikes();
+    if (!els.viewer.hidden) toast(liked ? 'Removed from liked' : '♥ Liked');
+  }
+
+  const SEARCH_STORE = 'onehome-search';
+
+  async function loadSearch(wanted) {
+    let id = wanted;
+    if (!id) { try { id = localStorage.getItem(SEARCH_STORE); } catch {} }
     els.gridStatus.className = 'status';
     els.gridStatus.textContent = 'Loading homes…';
     els.gridStatus.hidden = false;
     els.cards.replaceChildren();
     try {
-      const search = await getJson('/api/search');
+      const search = await getJson(`/api/search${id ? `?id=${encodeURIComponent(id)}` : ''}`);
       state.homes = search.homes || [];
-      els.searchName.textContent = search.name || 'Homes';
-      document.title = search.name || 'Homes';
-      els.searchCount.textContent = `${state.homes.length} ${state.homes.length === 1 ? 'home' : 'homes'}`;
-      sortHomes();
-      renderCards();
-      els.gridStatus.hidden = state.homes.length > 0;
-      els.gridStatus.textContent = 'This search has no homes right now.';
+      state.searchName = search.name || 'Homes';
+      document.title = state.searchName;
+      try { localStorage.setItem(SEARCH_STORE, search.id); } catch {}
+      els.searchPick.replaceChildren(...(search.searches || []).map((item) => h('option', { value: item.id }, item.name || 'Saved search')));
+      els.searchPick.value = search.id;
+      renderGrid();
       return true;
     } catch (err) {
       els.gridStatus.className = 'status error';
@@ -169,7 +250,7 @@
     state.gridScroll = window.scrollY;
     state.cameFromList = true;
     state.nav = state.order;
-    $('back').textContent = '‹ All homes';
+    $('back').textContent = state.view === 'liked' ? '‹ Liked' : '‹ All homes';
     location.hash = `#/home/${encodeURIComponent(id)}/1`;
   }
 
@@ -191,11 +272,14 @@
     els.viewer.hidden = true;
   }
 
-  function showGrid() {
+  function showGrid(view) {
     leaveViewer();
     els.mapView.hidden = true;
     els.grid.hidden = false;
-    window.scrollTo(0, state.gridScroll);
+    const changed = view !== state.view;
+    state.view = view;
+    renderGrid();
+    window.scrollTo(0, changed ? 0 : state.gridScroll);
   }
 
   function renderHeadline(home) {
@@ -203,6 +287,7 @@
     els.stats.textContent = statsLine(home);
     els.address.textContent = [home.street, home.cityLine].filter(Boolean).join(', ');
     const index = homeIndex();
+    paintLikes();
     els.homeCount.textContent = index >= 0 ? `Home ${index + 1} of ${state.nav.length}` : '';
   }
 
@@ -338,11 +423,22 @@
       : d.baths;
     const hoa = isSet(p.AssociationFee) ? `${money(p.AssociationFee)}${p.AssociationFeeFrequency ? ` ${String(p.AssociationFeeFrequency).toLowerCase()}` : ''}` : null;
     const taxes = isSet(p.TaxAnnualAmount) ? `${money(p.TaxAnnualAmount)}${p.TaxYear ? ` (${p.TaxYear})` : ''}` : null;
+    const place = [d.street, d.cityLine].filter(Boolean).join(', ') || `${d.lat},${d.lng}`;
     const lot = isSet(d.lot) ? `${text(d.lot)} ${d.lotUnits || ''}`.trim() : null;
 
     els.detailsBody.replaceChildren(
       h('h2', null, money(d.price)),
       h('p', { class: 'where' }, [d.street, d.cityLine].filter(Boolean).join(', ')),
+      h('p', { class: 'link-row' },
+        h('a', { class: 'pill', target: '_blank', rel: 'noopener', href: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(place)}` }, 'Google Maps ↗'),
+        typeof d.lat === 'number' && typeof d.lng === 'number'
+          && h('a', { class: 'pill', target: '_blank', rel: 'noopener', href: `https://www.google.com/maps/@?api=1&map_action=pano&viewpoint=${d.lat},${d.lng}` }, 'Street View ↗')),
+      ...section('Schools', factList([
+        ['High', p.HighSchool],
+        ['Middle', p.MiddleOrJuniorSchool],
+        ['Elementary', p.ElementarySchool],
+        ['County', d.county],
+      ])),
       ...section('The basics', factList([
         ['Status', d.status],
         ['Bedrooms', d.beds],
@@ -359,11 +455,6 @@
         ['Was', isSet(d.previousPrice) && d.previousPrice !== d.price ? money(d.previousPrice) : null],
       ])),
       ...section('About this home', isSet(p.PublicRemarks) ? h('p', { class: 'remarks' }, p.PublicRemarks) : null),
-      ...section('Schools', factList([
-        ['Elementary', p.ElementarySchool],
-        ['Middle', p.MiddleOrJuniorSchool],
-        ['High', p.HighSchool],
-      ])),
       ...section('Costs', factList([['HOA', hoa], ['Taxes', taxes]])),
       ...section('Inside and out', factList([
         ['Heating', p.Heating],
@@ -380,7 +471,6 @@
       ])),
       ...section('Neighborhood', factList([
         ['Subdivision', p.SubdivisionName],
-        ['County', p.CountyOrParish],
         ['Community', p.CommunityFeatures],
       ])),
       ...section('Listing', factList([
@@ -467,8 +557,9 @@
   async function submitLink(event) {
     event.preventDefault();
     els.linkError.hidden = true;
+    let added;
     try {
-      await getJson('/api/link', {
+      added = await getJson('/api/link', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ url: els.linkInput.value }),
@@ -483,8 +574,8 @@
     resetMap();
     refreshLinkStatus();
     history.replaceState(null, '', '#/');
-    showGrid();
-    loadSearch();
+    showGrid('saved');
+    loadSearch(added.searchId);
   }
 
   // ---------- link status ----------
@@ -542,7 +633,7 @@
   // ---------- map ----------
 
   const MAP_STORE = 'onehome-map';
-  const mapState = { map: null, layer: null, pins: [], selectedId: null, token: 0, timer: null };
+  const mapState = { map: null, layer: null, pins: [], selectedId: null, token: 0, schoolToken: 0, timer: null };
 
   function readStore() {
     try { return JSON.parse(localStorage.getItem(MAP_STORE)) || {}; } catch { return {}; }
@@ -551,7 +642,7 @@
     const { map } = mapState;
     if (!map) return;
     const center = map.getCenter();
-    const saved = { lat: center.lat, lng: center.lng, zoom: map.getZoom(), price: els.fPrice.value, beds: els.fBeds.value, type: els.fType.value };
+    const saved = { lat: center.lat, lng: center.lng, zoom: map.getZoom(), price: els.fPrice.value, beds: els.fBeds.value, school: els.fSchool.value };
     try { localStorage.setItem(MAP_STORE, JSON.stringify(saved)); } catch {}
   }
 
@@ -564,9 +655,11 @@
   function initMap() {
     if (mapState.map) return;
     const stored = readStore();
-    for (const [select, value] of [[els.fPrice, stored.price], [els.fBeds, stored.beds], [els.fType, stored.type]]) {
+    for (const [select, value] of [[els.fPrice, stored.price], [els.fBeds, stored.beds]]) {
       if (value && [...select.options].some((option) => option.value === value)) select.value = value;
     }
+    setSchoolOptions(stored.school ? [stored.school] : []);
+    els.fSchool.value = stored.school || '';
     const map = L.map('map', { zoomControl: false, worldCopyJump: true, minZoom: 4, maxZoom: 19 });
     L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
@@ -618,8 +711,9 @@
       s: bounds.getSouth(), w: bounds.getWest(), n: bounds.getNorth(), e: bounds.getEast(),
       // One level deeper than the screen, so more homes show as prices rather than bubbles.
       zoom: map.getZoom() + 1,
-      type: els.fType.value,
     });
+    if (els.fSchool.value) params.set('school', els.fSchool.value);
+    loadSchools(bounds);
     if (min) params.set('min', min);
     if (max) params.set('max', max);
     if (els.fBeds.value) params.set('beds', els.fBeds.value);
@@ -641,6 +735,24 @@
       : `${num.format(data.total)} ${data.total === 1 ? 'home' : 'homes'}${grouped ? ' · zoom in to see each one' : ''}`;
   }
 
+  // Keeps the chosen school in the list even when no home in view belongs to it.
+  function setSchoolOptions(names) {
+    const chosen = els.fSchool.value;
+    const all = [...new Set([...(chosen ? [chosen] : []), ...names])].sort((a, b) => a.localeCompare(b));
+    els.fSchool.replaceChildren(h('option', { value: '' }, 'Any school'), ...all.map((name) => h('option', { value: name }, `${name} HS`)));
+    els.fSchool.value = chosen;
+  }
+
+  async function loadSchools(bounds) {
+    const params = new URLSearchParams({ s: bounds.getSouth(), w: bounds.getWest(), n: bounds.getNorth(), e: bounds.getEast() });
+    const token = ++mapState.schoolToken;
+    try {
+      const { schools } = await getJson(`/api/schools?${params}`);
+      // Leave the list alone while someone has it open.
+      if (token === mapState.schoolToken && document.activeElement !== els.fSchool) setSchoolOptions(schools);
+    } catch {}
+  }
+
   function drawPins() {
     const { map, layer } = mapState;
     const savedIds = new Set(state.homes.map((home) => home.id));
@@ -653,8 +765,10 @@
         label = num.format(pin.count);
       } else {
         if (pin.ids.some((id) => savedIds.has(id))) classes += ' pin-saved';
+        const liked = pin.ids.some((id) => state.likes.has(id));
+        if (liked) classes += ' pin-liked';
         if (pin.ids.includes(mapState.selectedId)) classes += ' pin-selected';
-        label = pin.ids.length > 1 ? `${priceTag(pin.price)} ×${pin.ids.length}` : priceTag(pin.price);
+        label = `${liked ? '♥ ' : ''}${priceTag(pin.price)}${pin.ids.length > 1 ? ` ×${pin.ids.length}` : ''}`;
       }
       const icon = L.divIcon({ className: classes, html: h('span', null, label), iconSize: null });
       const marker = L.marker([pin.lat, pin.lng], { icon, keyboard: false, zIndexOffset: pin.cluster ? 0 : 500 });
@@ -689,7 +803,9 @@
             h('div', { class: 'map-card-price' }, money(home.price)),
             h('div', { class: 'map-card-stats' }, loaded ? statsLine(home) : 'Loading…'),
             h('div', { class: 'map-card-address' }, loaded ? [home.street, home.cityLine].filter(Boolean).join(', ') : ''),
+            loaded && schoolLine(home) && h('div', { class: 'map-card-school' }, schoolLine(home)),
             h('div', { class: 'map-card-cta' }, 'View photos ›'))),
+        heartButton(id),
         h('button', { class: 'map-card-close', type: 'button', 'aria-label': 'Close', onclick: closeMapCard }, '✕'));
       els.mapCard.hidden = false;
     };
@@ -753,7 +869,8 @@
   function route() {
     const match = location.hash.match(/^#\/home\/([^/]+)(?:\/(\d+))?/);
     if (!match) {
-      if (location.hash.startsWith('#/map')) showMap(); else showGrid();
+      if (location.hash.startsWith('#/map')) showMap();
+      else showGrid(location.hash.startsWith('#/liked') ? 'liked' : 'saved');
       return;
     }
     const id = decodeURIComponent(match[1]);
@@ -768,7 +885,7 @@
   function goBack() {
     if (state.cameFromList) { state.cameFromList = false; history.back(); return; }
     history.replaceState(null, '', '#/');
-    showGrid();
+    showGrid('saved');
   }
 
   function manual(action) {
@@ -828,6 +945,7 @@
       Escape: () => (sheetOpen ? closeSheets() : goBack()),
       ' ': toggleSlideshow,
       i: () => toggleSheet('details'),
+      l: () => toggleLike(state.homeId),
       g: () => toggleSheet('photos'),
       f: () => document.documentElement.requestFullscreen && toggleFullscreen(),
       h: () => els.viewer.classList.toggle('clean'),
@@ -846,18 +964,24 @@
     refreshLinkStatus();
   });
 
-  els.sort.addEventListener('change', () => { sortHomes(); renderCards(); });
-  $('change-link').addEventListener('click', () => showLinkDialog('Paste the link your agent sent you (the whole address, including ?token=…).'));
+  els.sort.addEventListener('change', renderGrid);
+  $('change-link').addEventListener('click', () => showLinkDialog('Paste a link from your agent’s email (the whole address, including ?token=…). A link to another of your saved searches is added alongside this one.'));
   $('link-cancel').addEventListener('click', () => els.dialog.close());
   $('link-form').addEventListener('submit', submitLink);
   $('map-search').addEventListener('submit', searchMap);
-  for (const select of [els.fPrice, els.fBeds, els.fType]) {
+  // The enlarged search bar stays up briefly after focus leaves, so a tap on Go still lands.
+  let searchingTimer = null;
+  els.mapQuery.addEventListener('focus', () => { clearTimeout(searchingTimer); els.mapBar.classList.add('searching'); });
+  els.mapQuery.addEventListener('blur', () => { searchingTimer = setTimeout(() => els.mapBar.classList.remove('searching'), 250); });
+  els.like.addEventListener('click', () => toggleLike(state.homeId));
+  els.searchPick.addEventListener('change', () => loadSearch(els.searchPick.value));
+  for (const select of [els.fPrice, els.fBeds, els.fSchool]) {
     select.addEventListener('change', () => { writeStore(); closeMapCard(); scheduleMapLoad(); });
   }
   setInterval(refreshLinkStatus, 60000);
   setInterval(renderLinkStatus, 30000);
   window.addEventListener('hashchange', route);
 
-  loadSearch().then(route);
+  Promise.all([loadSearch(), loadLikes()]).then(route);
   refreshLinkStatus();
 })();

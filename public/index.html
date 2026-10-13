@@ -24,10 +24,12 @@
       <p id="search-count"></p>
     </div>
     <div class="topbar-actions">
-      <nav class="switch" aria-label="View">
+      <nav class="switch" aria-label="View" id="grid-switch">
         <a href="#/" aria-current="page">Saved</a>
+        <a href="#/liked">♥ Liked</a>
         <a href="#/map">Map</a>
       </nav>
+      <select id="search-pick" aria-label="Saved search" hidden></select>
       <select id="sort" aria-label="Sort homes">
         <option value="agent">Agent's order</option>
         <option value="price-desc">Price: high to low</option>
@@ -49,10 +51,11 @@
   <div class="mapbar">
     <nav class="switch" aria-label="View">
       <a href="#/">Saved</a>
+      <a href="#/liked">♥ Liked</a>
       <a href="#/map" aria-current="page">Map</a>
     </nav>
     <form id="map-search" role="search">
-      <input id="map-q" type="search" placeholder="City, ZIP or address" aria-label="Search the map" enterkeyhint="search" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <input id="map-q" type="search" placeholder="City, ZIP, address" aria-label="Search the map" enterkeyhint="search" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
       <button type="submit" class="pill pill-primary">Go</button>
     </form>
     <select id="f-price" aria-label="Price">
@@ -74,9 +77,8 @@
       <option value="4">4+ beds</option>
       <option value="5">5+ beds</option>
     </select>
-    <select id="f-type" aria-label="Home type">
-      <option value="house">Houses</option>
-      <option value="all">All homes</option>
+    <select id="f-school" aria-label="High school">
+      <option value="">Any school</option>
     </select>
   </div>
   <div id="map-results" class="map-results" hidden></div>
@@ -106,6 +108,7 @@
     <button id="prev-home" type="button" class="pill">⏮ Prev home</button>
     <button id="toggle-photos" type="button" class="pill">All photos</button>
     <div class="counter counter-big" id="v-photo-count"></div>
+    <button id="toggle-like" type="button" class="pill like-pill" aria-pressed="false">♡ Like</button>
     <button id="toggle-play" type="button" class="pill">▶ Play</button>
     <button id="toggle-details" type="button" class="pill">Details</button>
     <button id="fullscreen" type="button" class="pill" hidden>⛶ Full screen</button>

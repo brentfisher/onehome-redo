@@ -10,6 +10,8 @@ const { Readable } = require('node:stream');
 const PORT = Number(process.env.PORT) || 3210;
 const API = 'https://services.onehome.com';
 const CONFIG_FILE = process.env.CONFIG_FILE || path.join(__dirname, 'config.json');
+// Liked homes are kept here, on this machine only; nothing is sent to OneHome.
+const LIKES_FILE = path.join(path.dirname(CONFIG_FILE), 'likes.json');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const UPSTREAM_TIMEOUT_MS = 20000;
@@ -25,8 +27,9 @@ let session = null; // { sessionToken, groupID, savedSearchID }
 // Whether OneHome accepted the link last time we asked: true, false, or null for "not known".
 let linkCheck = { ok: null, at: 0, error: null };
 let sessionPromise = null;
-let searchCache = null; // { at, data }
-let searchPromise = null;
+const searches = new Map(); // searchId -> { at, data } | { promise }
+const schoolCache = new Map();
+let likes = loadLikes(); // listingId -> summary
 const details = new Map(); // listingId -> { at, data } | { promise }
 
 function loadLink() {
@@ -34,21 +37,51 @@ function loadLink() {
     const saved = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
     if (saved.token) {
       const savedAt = saved.savedAt || fs.statSync(CONFIG_FILE).mtime.toISOString();
-      return { token: saved.token, searchId: saved.searchId || '', savedAt };
+      const searchIds = Array.isArray(saved.searchIds) ? saved.searchIds.filter(Boolean) : [saved.searchId].filter(Boolean);
+      return { token: saved.token, searchIds, savedAt };
     }
   } catch {}
-  return { token: '', searchId: '', savedAt: null };
+  return { token: '', searchIds: [], savedAt: null };
 }
 
+function saveLink() {
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(link, null, 2) + '\n');
+}
+
+// Each emailed link opens one saved search. A link for the same person adds its
+// search to the list; a link for someone else starts over.
 function setLink(next) {
-  link = { ...next, savedAt: new Date().toISOString() };
+  if (next.token === link.token) {
+    if (next.searchId && !link.searchIds.includes(next.searchId)) {
+      link.searchIds.push(next.searchId);
+      saveLink();
+    }
+    return;
+  }
+  link = { token: next.token, searchIds: [next.searchId].filter(Boolean), savedAt: new Date().toISOString() };
   linkCheck = { ok: null, at: 0, error: null };
   session = null;
   sessionPromise = null;
-  searchCache = null;
-  searchPromise = null;
+  searches.clear();
+  schoolCache.clear();
   details.clear();
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(link, null, 2) + '\n');
+  saveLink();
+}
+
+function loadLikes() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(LIKES_FILE, 'utf8'));
+    if (saved && typeof saved === 'object' && !Array.isArray(saved)) return saved;
+  } catch {}
+  return {};
+}
+
+function saveLikes() {
+  fs.writeFileSync(LIKES_FILE, JSON.stringify(likes, null, 2) + '\n');
+}
+
+function likedHomes() {
+  return Object.values(likes).sort((a, b) => String(b.likedAt).localeCompare(String(a.likedAt)));
 }
 
 // Accepts a full OneHome URL, or a bare token.
@@ -82,26 +115,61 @@ function upstreamHeaders(extra) {
   };
 }
 
-async function openSession() {
-  if (!link.token) throw new UpstreamError('No OneHome link yet. Paste the link from your agent’s email.', 401);
+// Trades a link token for a session. `rejected` on the error means OneHome
+// refused the token itself, as opposed to being unreachable.
+async function checkToken(token) {
   const res = await fetch(`${API}/api/authentication/checkToken`, {
     method: 'POST',
     headers: upstreamHeaders(),
-    body: JSON.stringify({ emailToken: link.token }),
+    body: JSON.stringify({ emailToken: token }),
     signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
   });
   const body = await res.text();
   let data = null;
   try { data = JSON.parse(body); } catch {}
-  // A 5xx says nothing about the link itself, so only 4xx marks it as rejected.
   if (res.status >= 500) throw new UpstreamError(`OneHome returned HTTP ${res.status}`, 502);
   if (!res.ok || !data?.sessionToken || !data?.groupID) {
-    const error = res.ok ? 'OneHome did not return a session for this link' : `OneHome rejected the link (HTTP ${res.status})`;
-    linkCheck = { ok: false, at: Date.now(), error };
-    throw new UpstreamError(error, 401);
+    const err = new UpstreamError(res.ok ? 'OneHome did not return a session for this link' : `OneHome rejected the link (HTTP ${res.status})`, 401);
+    err.rejected = true;
+    throw err;
   }
-  linkCheck = { ok: true, at: Date.now(), error: null };
   return data;
+}
+
+async function openSession() {
+  if (!link.token) throw new UpstreamError('No OneHome link yet. Paste the link from your agent’s email.', 401);
+  try {
+    const data = await checkToken(link.token);
+    linkCheck = { ok: true, at: Date.now(), error: null };
+    return data;
+  } catch (err) {
+    if (err.rejected) linkCheck = { ok: false, at: Date.now(), error: err.message };
+    throw err;
+  }
+}
+
+// Takes in a pasted link. Emails to different addresses carry different tokens
+// for the same OneHome account, so a link whose token opens the account already
+// in use only adds its saved search; any other link replaces the current one.
+async function acceptLink(next) {
+  if (link.token && next.token !== link.token) {
+    try {
+      const [mine, theirs] = await Promise.all([getSession(), checkToken(next.token)]);
+      if (mine.groupID === theirs.groupID) {
+        next = { token: link.token, searchId: next.searchId || theirs.savedSearchID || '' };
+      }
+    } catch {}
+  }
+  // Check an extra search really opens before keeping it in the list.
+  if (next.token === link.token && next.searchId && !link.searchIds.includes(next.searchId)) {
+    try {
+      await loadSearch(next.searchId);
+    } catch (err) {
+      throw new UpstreamError(`OneHome would not open that saved search (${err.message}).`, 400);
+    }
+  }
+  setLink(next);
+  return next.searchId || null;
 }
 
 // Finds an expiry time inside a link token, if it carries one. OneHome's emailed
@@ -191,6 +259,7 @@ const LISTINGS_QUERY = `query($groupId: String!, $listingIds: [String!]!, $pageI
         BedroomsTotal BathroomsTotalInteger
         LivingArea LivingAreaTotal AboveGradeFinishedArea BuildingAreaTotal
         LotSizeArea LotSizeUnits MajorChangeType Latitude Longitude
+        HighSchool CountyOrParish
       }
       customProperty { LivingAreaRange }
     }
@@ -252,12 +321,18 @@ function summarize(listing) {
     lotUnits: p.LotSizeUnits,
     lat: p.Latitude ?? null,
     lng: p.Longitude ?? null,
+    highSchool: p.HighSchool || null,
+    county: [p.CountyOrParish].flat().filter(Boolean).join(', ') || null,
   };
 }
 
-async function fetchSearch() {
-  const searchId = link.searchId || (await getSession()).savedSearchID;
-  if (!searchId) throw new UpstreamError('This link has no saved search (searchId) attached', 400);
+async function searchIds() {
+  if (link.searchIds.length) return link.searchIds;
+  const fallback = (await getSession()).savedSearchID;
+  return fallback ? [fallback] : [];
+}
+
+async function fetchSearch(searchId) {
   const { savedSearch } = await gql(SAVED_SEARCH_QUERY, () => ({ searchId }));
   if (!savedSearch) throw new UpstreamError('Saved search not found', 404);
 
@@ -273,25 +348,38 @@ async function fetchSearch() {
     listings.push(...(page.listings || []));
     totalPages = Math.min(page.pageInfo?.totalPages || 1, 50);
   }
-  return { name: savedSearch.name, homes: listings.map(summarize) };
+  return { id: searchId, name: savedSearch.name, homes: listings.map(summarize) };
 }
 
-async function getSearch() {
-  if (searchCache && Date.now() - searchCache.at < SEARCH_TTL_MS) return searchCache.data;
-  if (!searchPromise) {
-    const mine = fetchSearch().then(
-      (data) => {
-        if (searchPromise === mine) { searchCache = { at: Date.now(), data }; searchPromise = null; }
-        return data;
-      },
-      (err) => {
-        if (searchPromise === mine) searchPromise = null;
-        throw err;
-      },
-    );
-    searchPromise = mine;
-  }
-  return searchPromise;
+function loadSearch(searchId) {
+  const entry = searches.get(searchId);
+  if (entry?.data && Date.now() - entry.at < SEARCH_TTL_MS) return Promise.resolve(entry.data);
+  if (entry?.promise) return entry.promise;
+  const promise = fetchSearch(searchId).then(
+    (data) => {
+      if (searches.get(searchId)?.promise === promise) searches.set(searchId, { at: Date.now(), data });
+      return data;
+    },
+    (err) => {
+      if (searches.get(searchId)?.promise === promise) searches.delete(searchId);
+      throw err;
+    },
+  );
+  searches.set(searchId, { promise });
+  return promise;
+}
+
+// The search asked for, or the first one, plus the names of all of them for the picker.
+async function getSearch(wanted) {
+  const ids = await searchIds();
+  if (!ids.length) throw new UpstreamError('This link has no saved search (searchId) attached', 400);
+  const id = ids.includes(wanted) ? wanted : ids[0];
+  const [current, ...others] = await Promise.all([
+    loadSearch(id),
+    ...ids.filter((other) => other !== id).map((other) => loadSearch(other).catch(() => ({ id: other, name: 'Saved search' }))),
+  ]);
+  const names = new Map([current, ...others].map((search) => [search.id, search.name]));
+  return { ...current, searches: ids.map((searchId) => ({ id: searchId, name: names.get(searchId) })) };
 }
 
 function photoList(items, kind) {
@@ -364,10 +452,8 @@ function mapFilters(params) {
   };
   // Without a listing type OneHome returns nothing at all.
   const filters = [{ fieldName: '', type: 'LISTING_TYPE', values: ['FOR_SALE'] }];
-  // Otherwise results include land and commercial property.
-  filters.push(params.get('type') === 'all'
-    ? { fieldName: 'property.PropertyType', type: 'TERMS', values: ['Residential'] }
-    : { fieldName: '', type: 'PROPERTY_TYPE', values: ['House'] });
+  // Houses only; otherwise results include land, condos and commercial property.
+  filters.push({ fieldName: '', type: 'PROPERTY_TYPE', values: ['House'] });
   const min = whole('min');
   const max = whole('max');
   if (min !== null || max !== null) {
@@ -375,21 +461,57 @@ function mapFilters(params) {
   }
   const beds = whole('beds');
   if (beds) filters.push({ fieldName: 'property.BedroomsTotal', type: 'RANGE', values: [String(beds), String(BEDS_CEILING)] });
+  // School names must match OneHome's spelling and capitals exactly.
+  const school = (params.get('school') || '').trim().slice(0, 80);
+  if (school) filters.push({ fieldName: 'property.HighSchool', type: 'TERMS', values: [school] });
   return filters;
 }
 
-async function mapPins(params) {
+function mapPolygon(params) {
   const [south, west, north, east] = ['s', 'w', 'n', 'e'].map((key) => Number(params.get(key)));
-  const zoom = Math.round(Number(params.get('zoom')));
-  const valid = [south, west, north, east, zoom].every(Number.isFinite)
+  const valid = [south, west, north, east].every(Number.isFinite)
     && south < north && west < east && Math.abs(south) <= 90 && Math.abs(north) <= 90;
   if (!valid) throw new UpstreamError('The map area is not valid', 400);
-  const polygon = [
+  return [
     { latitude: north, longitude: east },
     { latitude: south, longitude: east },
     { latitude: south, longitude: west },
     { latitude: north, longitude: west },
   ];
+}
+
+const SCHOOLS_QUERY = `query($groupId: String!, $browseParameter: BrowseParameter) {
+  listings(groupId: $groupId, browseParameter: $browseParameter, includeDislikes: false) {
+    listings { property { HighSchool } }
+  }
+}`;
+
+// High schools of the homes for sale in the area, most common first. It reads a
+// sample of up to 200 homes, so a very wide view can miss a small school.
+async function mapSchools(params) {
+  const polygon = mapPolygon(params);
+  const key = polygon.map((point) => `${point.latitude.toFixed(2)},${point.longitude.toFixed(2)}`).join('|');
+  const cached = schoolCache.get(key);
+  if (cached && Date.now() - cached.at < SEARCH_TTL_MS) return cached.data;
+  const data = await gql(SCHOOLS_QUERY, (s) => ({
+    groupId: s.groupID,
+    browseParameter: { searchQuery: mapFilters(new URLSearchParams()), polygon, pageInput: { pageNum: 0, size: 200 } },
+  }));
+  const counts = new Map();
+  for (const listing of data.listings?.listings || []) {
+    const name = listing.property?.HighSchool;
+    if (name) counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  const schools = [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([name]) => name);
+  if (schoolCache.size > 100) schoolCache.clear();
+  schoolCache.set(key, { at: Date.now(), data: { schools } });
+  return { schools };
+}
+
+async function mapPins(params) {
+  const polygon = mapPolygon(params);
+  const zoom = Math.round(Number(params.get('zoom')));
+  if (!Number.isFinite(zoom)) throw new UpstreamError('The map area is not valid', 400);
   const data = await gql(PINS_QUERY, (s) => ({
     groupId: s.groupID,
     browseParameter: { searchQuery: mapFilters(params), polygon, pageInput: { pageNum: 0, size: 300 } },
@@ -525,20 +647,35 @@ async function route(req, res) {
     try { payload = JSON.parse(await readBody(req)); } catch {}
     const next = parseLink(payload.url);
     if (!next) return sendJson(res, 400, { error: 'That does not look like a OneHome link. Paste the whole address, including ?token=…' });
-    setLink(next);
-    return sendJson(res, 200, { ok: true });
+    return sendJson(res, 200, { ok: true, searchId: await acceptLink(next) });
+  }
+  if (parts[0] === 'api' && parts[1] === 'likes' && parts[2] && parts.length === 3) {
+    const id = parts[2];
+    if (req.method === 'PUT') {
+      // The server looks the home up itself, so the page cannot store made-up details.
+      const { property: _property, photos: _photos, ...summary } = await getDetail(id);
+      likes[id] = { ...summary, likedAt: likes[id]?.likedAt || new Date().toISOString() };
+      saveLikes();
+      return sendJson(res, 200, { homes: likedHomes() });
+    }
+    if (req.method === 'DELETE') {
+      if (likes[id]) { delete likes[id]; saveLikes(); }
+      return sendJson(res, 200, { homes: likedHomes() });
+    }
   }
   if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'Method not allowed' });
 
   // The original OneHome link works here too with the host swapped for this server.
   if (url.searchParams.has('token')) {
     const next = parseLink(url.href);
-    if (next && (next.token !== link.token || next.searchId !== link.searchId)) setLink(next);
+    if (next) await acceptLink(next);
     res.writeHead(302, { location: '/' });
     return res.end();
   }
 
-  if (url.pathname === '/api/search') return sendJson(res, 200, await getSearch());
+  if (url.pathname === '/api/search') return sendJson(res, 200, await getSearch(url.searchParams.get('id')));
+  if (url.pathname === '/api/likes') return sendJson(res, 200, { homes: likedHomes() });
+  if (url.pathname === '/api/schools') return sendJson(res, 200, await mapSchools(url.searchParams));
   if (url.pathname === '/api/link/status') return sendJson(res, 200, await linkStatus());
   if (url.pathname === '/api/map') return sendJson(res, 200, await mapPins(url.searchParams));
   if (url.pathname === '/api/lookup') {

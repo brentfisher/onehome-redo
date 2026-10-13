@@ -2,3 +2,4 @@ config.json
 node_modules/
 .claude/
 .DS_Store
+likes.json
